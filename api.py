@@ -46,6 +46,8 @@ from cache import cached  # noqa: E402
 # ── Constants ───────────────────────────────────────────────────────────────
 
 JAYS_TEAM_ID = 141            # MLB Stats API team id for Toronto Blue Jays
+JAYS_AAA_TEAM_ID = 422        # Buffalo Bisons — Jays' Triple-A affiliate (International League)
+AAA_SPORT_ID = 11             # sportId for Triple-A (used to pull minor-league season stats)
 AL_EAST_DIV_ID = 201          # Division id (AL East)
 ALL_LEAGUES = "103,104"       # AL=103, NL=104
 
@@ -175,6 +177,84 @@ def _roster() -> list[dict]:
                 "name": name.strip(),
             })
     return rows
+
+
+@cached(ttl_seconds=900)
+def _injured_list() -> list[dict]:
+    """Players on the Blue Jays' major-league injured list.
+
+    Pulled from the 40-man roster, whose per-player `status.description`
+    carries the IL designation (e.g. 'Injured 10-Day', 'Injured 15-Day',
+    'Injured 60-Day'). The 40-man is the right scope: it excludes the
+    minor-league 7-Day IL noise you'd get from the full org roster, so
+    this is exactly 'who's hurt off the big-league club right now'.
+    """
+    raw = statsapi.get(
+        "team_roster",
+        {"teamId": JAYS_TEAM_ID, "rosterType": "40Man"},
+    )
+    out = []
+    for r in raw.get("roster", []):
+        desc = (r.get("status") or {}).get("description", "") or ""
+        if "injured" not in desc.lower():
+            continue
+        person = r.get("person") or {}
+        out.append({
+            "name": person.get("fullName"),
+            "position": (r.get("position") or {}).get("abbreviation"),
+            "il_status": desc,          # e.g. "Injured 60-Day"
+        })
+    out.sort(key=lambda p: (p.get("il_status") or "", p.get("name") or ""))
+    return out
+
+
+@cached(ttl_seconds=3600)
+def _aaa_roster() -> list[dict]:
+    """Buffalo Bisons (AAA) active roster with each player's AAA season line.
+
+    One hydrated MLB Stats API call returns the roster plus every player's
+    Triple-A (sportId=11) season hitting/pitching split, so Johnny can judge
+    who's actually raking / dealing in the upper minors — not just read names.
+    """
+    season = current_season()
+    raw = statsapi.get(
+        "team_roster",
+        {
+            "teamId": JAYS_AAA_TEAM_ID,
+            "rosterType": "active",
+            "season": season,
+            "hydrate": f"person(stats(type=season,sportId={AAA_SPORT_ID},season={season}))",
+        },
+    )
+    out = []
+    for r in raw.get("roster", []):
+        person = r.get("person") or {}
+        row: dict[str, Any] = {
+            "name": person.get("fullName"),
+            "position": (r.get("position") or {}).get("abbreviation"),
+            "hitting": None,
+            "pitching": None,
+        }
+        for split in person.get("stats", []) or []:
+            group = (split.get("group") or {}).get("displayName")
+            splits = split.get("splits") or []
+            stat = (splits[0].get("stat") if splits else {}) or {}
+            if group == "hitting" and stat.get("atBats"):
+                row["hitting"] = {
+                    "avg": stat.get("avg"), "obp": stat.get("obp"), "slg": stat.get("slg"),
+                    "ops": stat.get("ops"), "hr": stat.get("homeRuns"), "rbi": stat.get("rbi"),
+                    "sb": stat.get("stolenBases"), "ab": stat.get("atBats"),
+                    "games": stat.get("gamesPlayed"),
+                }
+            elif group == "pitching" and stat.get("inningsPitched"):
+                row["pitching"] = {
+                    "era": stat.get("era"), "whip": stat.get("whip"),
+                    "ip": stat.get("inningsPitched"), "k": stat.get("strikeOuts"),
+                    "bb": stat.get("baseOnBalls"), "w": stat.get("wins"), "l": stat.get("losses"),
+                    "sv": stat.get("saves"), "games": stat.get("gamesPlayed"),
+                }
+        out.append(row)
+    return out
 
 
 def _format_game(g: dict) -> dict:
@@ -578,6 +658,28 @@ def jays_roster():
         return ok(_roster())
     except Exception as e:
         log.exception("roster")
+        return JSONResponse(err(str(e)), status_code=200)
+
+
+@app.get("/api/jays/injured-list")
+def jays_injured_list():
+    """Who's on the Blue Jays' major-league IL right now, with each player's
+    IL designation (10-Day / 15-Day / 60-Day)."""
+    try:
+        return ok(_injured_list())
+    except Exception as e:
+        log.exception("injured-list")
+        return JSONResponse(err(str(e)), status_code=200)
+
+
+@app.get("/api/jays/aaa-roster")
+def jays_aaa_roster():
+    """Buffalo Bisons (AAA) active roster, each with their Triple-A season
+    stat line, so call-up / depth questions get answered from real numbers."""
+    try:
+        return ok(_aaa_roster())
+    except Exception as e:
+        log.exception("aaa-roster")
         return JSONResponse(err(str(e)), status_code=200)
 
 
