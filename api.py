@@ -897,3 +897,157 @@ def mlb_standings():
     except Exception as e:
         log.exception("mlb-standings")
         return JSONResponse(err(str(e)), status_code=200)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Pitching visuals (HeecheeJays Savant-style graphics, P1)
+#
+# Pre-aggregated on the server so the app never ships raw Statcast
+# frames: /api/pitcher/arsenal (per-pitch-type table that anchors the
+# movement plot) and /api/pitcher/locations (capped scatter + strike
+# zone bounds). Movement in inches (pfx * 12), catcher's-view signs
+# left as Statcast provides them; p_throws is included so the client
+# can annotate glove/arm side. xwOBA is contact-only (mean of
+# estimated_woba_using_speedangle over batted balls) and is named
+# accordingly — never presented as full xwOBA-against.
+# ─────────────────────────────────────────────────────────────────────────────
+
+PITCH_NAMES = {
+    "FF": "4-Seam Fastball", "SI": "Sinker", "FC": "Cutter",
+    "SL": "Slider", "ST": "Sweeper", "SV": "Slurve", "CU": "Curveball",
+    "KC": "Knuckle Curve", "CS": "Slow Curve", "CH": "Changeup",
+    "FS": "Splitter", "FO": "Forkball", "SC": "Screwball",
+    "KN": "Knuckleball", "EP": "Eephus", "PO": "Pitchout",
+}
+
+_WHIFF_DESCS = {"swinging_strike", "swinging_strike_blocked", "missed_bunt"}
+_SWING_DESCS = _WHIFF_DESCS | {"foul", "hit_into_play", "foul_tip"}
+
+
+def _pitcher_frame(name: str, days: int):
+    """Resolve + fetch, preferring the season-long cache for big
+    windows. Returns (player, df) or (None, error_detail)."""
+    player = _resolve_player(name)
+    if not player or not player.get("mlbam_id"):
+        return None, f"could not resolve player {name!r}"
+    mlbam = player["mlbam_id"]
+    df = (_statcast_pitcher_season(mlbam) if days >= 300
+          else _statcast_pitcher_window(mlbam, days))
+    if df is None or df.empty:
+        return None, f"no Statcast pitching data for {player['full_name']}"
+    return (player, df), None
+
+
+@app.get("/api/pitcher/arsenal")
+def get_pitcher_arsenal(name: str = Query(..., min_length=2),
+                        days: int = Query(365, ge=7, le=730)):
+    """Per-pitch-type arsenal: usage, velo, spin, movement (inches),
+    whiff%, contact xwOBA, arm angle / release."""
+    try:
+        resolved, detail = _pitcher_frame(name, days)
+        if resolved is None:
+            return JSONResponse(err(detail), status_code=200)
+        player, df = resolved
+        df = df[df["pitch_type"].notna()]
+        total = len(df)
+        if not total:
+            return JSONResponse(err("no classified pitches"), status_code=200)
+        p_throws = (str(df["p_throws"].mode().iloc[0])
+                    if "p_throws" in df.columns and not df["p_throws"].isna().all()
+                    else None)
+        out = []
+        for ptype, g in df.groupby("pitch_type"):
+            n = len(g)
+            if n < 5:
+                continue
+            desc = g.get("description", pd.Series([], dtype=object))
+            swings = int(desc.isin(_SWING_DESCS).sum())
+            whiffs = int(desc.isin(_WHIFF_DESCS).sum())
+            xw = g.get("estimated_woba_using_speedangle")
+            arm = g.get("arm_angle")
+            row = {
+                "pitch_type": str(ptype),
+                "pitch_name": PITCH_NAMES.get(str(ptype), str(ptype)),
+                "count": n,
+                "usage_pct": n / total,
+                "avg_velo": float(g["release_speed"].mean()),
+                "max_velo": float(g["release_speed"].max()),
+                "avg_spin": (float(g["release_spin_rate"].mean())
+                             if g["release_spin_rate"].notna().any() else None),
+                "ivb_in": (float(g["pfx_z"].mean() * 12)
+                           if "pfx_z" in g.columns else None),
+                "hb_in": (float(g["pfx_x"].mean() * 12)
+                          if "pfx_x" in g.columns else None),
+                "whiff_pct": (whiffs / swings) if swings else None,
+                "xwoba_contact": (float(xw.mean())
+                                  if xw is not None and xw.notna().any() else None),
+                "arm_angle_avg": (float(arm.mean())
+                                  if arm is not None and arm.notna().any() else None),
+                "release_x": (float(g["release_pos_x"].mean())
+                              if "release_pos_x" in g.columns else None),
+                "release_z": (float(g["release_pos_z"].mean())
+                              if "release_pos_z" in g.columns else None),
+                "extension": (float(g["release_extension"].mean())
+                              if "release_extension" in g.columns
+                              and g["release_extension"].notna().any() else None),
+            }
+            out.append(round_floats(row, decimals=3))
+        out.sort(key=lambda r: r["count"], reverse=True)
+        return ok({"player": player["full_name"], "mlbam_id": player["mlbam_id"],
+                   "p_throws": p_throws, "days": days, "total_pitches": total,
+                   "arsenal": out})
+    except Exception as e:
+        log.exception("pitcher-arsenal")
+        return JSONResponse(err(str(e)), status_code=200)
+
+
+@app.get("/api/pitcher/locations")
+def get_pitcher_locations(name: str = Query(..., min_length=2),
+                          days: int = Query(365, ge=7, le=730),
+                          pitch_type: str | None = None,
+                          outcome: str = Query("all")):
+    """Pitch locations (catcher's view), downsampled to ≤400 points,
+    plus average strike-zone bounds for drawing the rectangle."""
+    try:
+        resolved, detail = _pitcher_frame(name, days)
+        if resolved is None:
+            return JSONResponse(err(detail), status_code=200)
+        player, df = resolved
+        df = df[df["plate_x"].notna() & df["plate_z"].notna()
+                & df["pitch_type"].notna()]
+        if pitch_type:
+            df = df[df["pitch_type"] == pitch_type.upper()]
+        desc = df.get("description", pd.Series([], dtype=object))
+
+        def classify(d: str) -> str:
+            if d in _WHIFF_DESCS:
+                return "whiff"
+            if d == "called_strike":
+                return "called_strike"
+            if d == "hit_into_play":
+                return "in_play"
+            if d in ("ball", "blocked_ball", "pitchout"):
+                return "ball"
+            return "other"
+
+        df = df.assign(_outcome=desc.map(classify))
+        if outcome != "all":
+            df = df[df["_outcome"] == outcome]
+        if df.empty:
+            return JSONResponse(err("no pitches match those filters"),
+                                status_code=200)
+        sz_top = float(df["sz_top"].mean()) if df["sz_top"].notna().any() else 3.4
+        sz_bot = float(df["sz_bot"].mean()) if df["sz_bot"].notna().any() else 1.6
+        sample = df if len(df) <= 400 else df.sample(n=400, random_state=14)
+        points = [
+            {"x": round(float(r.plate_x), 2), "z": round(float(r.plate_z), 2),
+             "type": str(r.pitch_type), "outcome": str(r._outcome)}
+            for r in sample.itertuples()
+        ]
+        return ok({"player": player["full_name"], "mlbam_id": player["mlbam_id"],
+                   "days": days, "n_total": int(len(df)),
+                   "sz_top_avg": round(sz_top, 2), "sz_bot_avg": round(sz_bot, 2),
+                   "points": points})
+    except Exception as e:
+        log.exception("pitcher-locations")
+        return JSONResponse(err(str(e)), status_code=200)
