@@ -1030,9 +1030,9 @@ def get_pitcher_locations(name: str = Query(..., min_length=2),
                 return "ball"
             return "other"
 
-        df = df.assign(_outcome=desc.map(classify))
+        df = df.assign(outcome_class=desc.map(classify))
         if outcome != "all":
-            df = df[df["_outcome"] == outcome]
+            df = df[df["outcome_class"] == outcome]
         if df.empty:
             return JSONResponse(err("no pitches match those filters"),
                                 status_code=200)
@@ -1041,7 +1041,7 @@ def get_pitcher_locations(name: str = Query(..., min_length=2),
         sample = df if len(df) <= 400 else df.sample(n=400, random_state=14)
         points = [
             {"x": round(float(r.plate_x), 2), "z": round(float(r.plate_z), 2),
-             "type": str(r.pitch_type), "outcome": str(r._outcome)}
+             "type": str(r.pitch_type), "outcome": str(r.outcome_class)}
             for r in sample.itertuples()
         ]
         return ok({"player": player["full_name"], "mlbam_id": player["mlbam_id"],
