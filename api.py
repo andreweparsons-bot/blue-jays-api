@@ -363,6 +363,21 @@ def _statcast_pitcher_season(mlbam_id: int) -> pd.DataFrame:
     return df if df is not None else pd.DataFrame()
 
 
+# Completed seasons never change — cache for a week.
+@cached(ttl_seconds=7 * 24 * 3600)
+def _statcast_batter_year(mlbam_id: int, year: int) -> pd.DataFrame:
+    log.info("fetching Statcast batter %s season %s", mlbam_id, year)
+    df = pybaseball.statcast_batter(f"{year}-03-01", f"{year}-11-30", mlbam_id)
+    return df if df is not None else pd.DataFrame()
+
+
+@cached(ttl_seconds=7 * 24 * 3600)
+def _statcast_pitcher_year(mlbam_id: int, year: int) -> pd.DataFrame:
+    log.info("fetching Statcast pitcher %s season %s", mlbam_id, year)
+    df = pybaseball.statcast_pitcher(f"{year}-03-01", f"{year}-11-30", mlbam_id)
+    return df if df is not None else pd.DataFrame()
+
+
 @cached(ttl_seconds=3600)
 def _statcast_batter_window(mlbam_id: int, days: int) -> pd.DataFrame:
     end = datetime.now().date()
@@ -716,11 +731,17 @@ def jays_player(name: str = Query(..., min_length=2)):
 
 
 @app.get("/api/jays/player/advanced")
-def jays_player_advanced(name: str = Query(..., min_length=2)):
+def jays_player_advanced(name: str = Query(..., min_length=2),
+                         season: int | None = Query(default=None, ge=2015)):
     """Season sabermetrics computed from Statcast events.
 
     Hitters get:  AVG/OBP/SLG/OPS/wOBA/ISO/BABIP/K%/BB%/xwOBA/xBA/xSLG/exit-velo/barrel%/hard-hit%
     Pitchers get: IP/K/BB/H/HR/K-9/BB-9/K%/BB%/K-BB%/AVG-against/WHIP/FIP/velocity/spin/whiff%
+
+    `season` selects a prior year (completed seasons cached a week) —
+    powers the app's 2025-vs-2026 comparison pills for Savant stats.
+    Note: wOBA uses the 2024 linear weights for every year (close
+    enough for comparison purposes; documented in WOBA_W).
     """
     try:
         resolved = _resolve_player(name)
@@ -728,17 +749,19 @@ def jays_player_advanced(name: str = Query(..., min_length=2)):
             return JSONResponse(err(f"Player not found: {name}"), status_code=200)
 
         mlbam = resolved["mlbam_id"]
+        year = season if (season and season != current_season()) else None
         out: dict = {
             "name": resolved["full_name"],
             "mlbam_id": mlbam,
-            "season": current_season(),
+            "season": year or current_season(),
             "on_jays": resolved["on_jays"],
             "batting": None,
             "pitching": None,
         }
 
         try:
-            bdf = _statcast_batter_season(mlbam)
+            bdf = _statcast_batter_year(mlbam, year) if year \
+                else _statcast_batter_season(mlbam)
             if not bdf.empty:
                 merged = {**_aggregate_batter_basic(bdf), **_aggregate_batter_quality(bdf)}
                 if merged:
@@ -747,7 +770,8 @@ def jays_player_advanced(name: str = Query(..., min_length=2)):
             log.info("batter season for %s: %s", mlbam, e)
 
         try:
-            pdf = _statcast_pitcher_season(mlbam)
+            pdf = _statcast_pitcher_year(mlbam, year) if year \
+                else _statcast_pitcher_season(mlbam)
             if not pdf.empty:
                 merged = {**_aggregate_pitcher_basic(pdf), **_aggregate_pitcher_quality(pdf)}
                 if merged:
