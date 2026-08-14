@@ -180,8 +180,8 @@ def _roster() -> list[dict]:
 
 
 @cached(ttl_seconds=900)
-def _injured_list() -> list[dict]:
-    """Players on the Blue Jays' major-league injured list.
+def _injured_list(team_id: int = JAYS_TEAM_ID) -> list[dict]:
+    """Players on a team's major-league injured list.
 
     Pulled from the 40-man roster, whose per-player `status.description`
     carries the IL designation (e.g. 'Injured 10-Day', 'Injured 15-Day',
@@ -191,7 +191,7 @@ def _injured_list() -> list[dict]:
     """
     raw = statsapi.get(
         "team_roster",
-        {"teamId": JAYS_TEAM_ID, "rosterType": "40Man"},
+        {"teamId": team_id, "rosterType": "40Man"},
     )
     out = []
     for r in raw.get("roster", []):
@@ -677,11 +677,12 @@ def jays_roster():
 
 
 @app.get("/api/jays/injured-list")
-def jays_injured_list():
-    """Who's on the Blue Jays' major-league IL right now, with each player's
-    IL designation (10-Day / 15-Day / 60-Day)."""
+def jays_injured_list(team_id: int | None = Query(None, ge=100, le=200)):
+    """Who's on a team's major-league IL right now, with each player's
+    IL designation (10-Day / 15-Day / 60-Day). Defaults to the Jays;
+    pass team_id for any MLB club (e.g. the current opponent)."""
     try:
-        return ok(_injured_list())
+        return ok(_injured_list(team_id or JAYS_TEAM_ID))
     except Exception as e:
         log.exception("injured-list")
         return JSONResponse(err(str(e)), status_code=200)
@@ -907,6 +908,97 @@ def al_east_standings():
         return ok(_div_table(AL_EAST_DIV_ID))
     except Exception as e:
         log.exception("al-east-standings")
+        return JSONResponse(err(str(e)), status_code=200)
+
+
+AL_DIV_IDS = {200, 201, 202}  # AL West / East / Central
+
+
+@app.get("/api/al-wildcard")
+def al_wildcard():
+    """The AL Wild Card race: every AL club that is NOT leading its
+    division, ordered by wildcard rank. wc_gb is relative to the last
+    wildcard spot ('+1.5' = holds the spot by 1.5)."""
+    try:
+        data = _standings_data()
+        rows = []
+        for div_id, div in data.items():
+            if int(div_id) not in AL_DIV_IDS:
+                continue
+            for r in div.get("teams", []):
+                if str(r.get("div_rank")) == "1":
+                    continue
+                rows.append({
+                    "team": r.get("name"),
+                    "wins": r.get("w"),
+                    "losses": r.get("l"),
+                    "win_pct": r.get("pct"),
+                    "wildcard_rank": safe(r.get("wc_rank")),
+                    "wildcard_games_back": r.get("wc_gb"),
+                    "elimination_number": r.get("wc_elim_num"),
+                })
+        def wc_key(r):
+            try:
+                return int(r["wildcard_rank"])
+            except (TypeError, ValueError):
+                return 99
+        rows.sort(key=wc_key)
+        return ok(rows)
+    except Exception as e:
+        log.exception("al-wildcard")
+        return JSONResponse(err(str(e)), status_code=200)
+
+
+# League-wide Savant expected stats (xBA / xSLG / xwOBA), one Savant
+# leaderboard pull each for batters and pitchers, keyed by MLBAM id.
+# This is what lets the app answer roster-wide comparison questions
+# ("which Yankees have a lower xwOBA than Clement?") without a
+# per-player Statcast crunch.
+@cached(ttl_seconds=12 * 3600)
+def _expected_stats(season: int) -> dict:
+    def frame_to_map(df: pd.DataFrame) -> dict:
+        out: dict[str, dict] = {}
+        if df is None or df.empty:
+            return out
+        name_col = next((c for c in ("last_name, first_name", "name", "player_name")
+                         if c in df.columns), None)
+        keep = ["pa", "bip", "ba", "est_ba", "slg", "est_slg",
+                "woba", "est_woba", "era", "xera"]
+        for _, r in df.iterrows():
+            pid = r.get("player_id")
+            if pd.isna(pid):
+                continue
+            row: dict[str, Any] = {}
+            if name_col:
+                raw = str(r[name_col])
+                # Savant leaderboards use "Last, First"
+                if ", " in raw:
+                    last, first = raw.split(", ", 1)
+                    row["name"] = f"{first} {last}"
+                else:
+                    row["name"] = raw
+            for k in keep:
+                if k in df.columns and not pd.isna(r[k]):
+                    row[k] = safe(r[k])
+            out[str(int(pid))] = row
+        return out
+
+    bat = pybaseball.statcast_batter_expected_stats(season, minPA=25)
+    pit = pybaseball.statcast_pitcher_expected_stats(season, minPA=25)
+    return {"season": season,
+            "batting": frame_to_map(bat),
+            "pitching": frame_to_map(pit)}
+
+
+@app.get("/api/league/expected-stats")
+def league_expected_stats(season: int | None = Query(None, ge=2015, le=2030)):
+    """League-wide Savant expected stats keyed by MLBAM id
+    (min 25 PA). {"batting": {id: {name, pa, ba, est_ba, slg,
+    est_slg, woba, est_woba}}, "pitching": {id: {..., era, xera}}}."""
+    try:
+        return ok(_expected_stats(season or current_season()))
+    except Exception as e:
+        log.exception("league-expected-stats")
         return JSONResponse(err(str(e)), status_code=200)
 
 
