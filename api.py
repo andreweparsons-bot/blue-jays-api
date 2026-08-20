@@ -1002,6 +1002,49 @@ def league_expected_stats(season: int | None = Query(None, ge=2015, le=2030)):
         return JSONResponse(err(str(e)), status_code=200)
 
 
+# ── Interactive splits: any since-date × any opposing hand ──────────
+#
+# StatsAPI cannot combine byDateRange with sitCodes (verified: the
+# hand filter is silently ignored), so this computes the combo from
+# raw Statcast events: batter frames carry p_throws (opposing
+# pitcher's hand), pitcher frames carry stand (batter's side). Rates
+# come from the same aggregators the rest of the API uses.
+
+@app.get("/api/player/splits")
+def player_splits(name: str = Query(..., min_length=2),
+                  group: str = Query("batting"),
+                  since: str | None = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
+                  vs_hand: str | None = Query(None, pattern="^[LR]$")):
+    """Season-to-date splits with BOTH a date floor and an opposing-
+    hand filter (either optional). group=batting|pitching."""
+    try:
+        player = _resolve_player(name)
+        if not player or not player.get("mlbam_id"):
+            return JSONResponse(err(f"could not resolve player {name!r}"),
+                                status_code=200)
+        mlbam = player["mlbam_id"]
+        df = (_statcast_batter_season(mlbam) if group == "batting"
+              else _statcast_pitcher_season(mlbam))
+        if df is None or df.empty:
+            return JSONResponse(err("no Statcast data"), status_code=200)
+        if since and "game_date" in df.columns:
+            df = df[df["game_date"] >= since]
+        hand_col = "p_throws" if group == "batting" else "stand"
+        if vs_hand and hand_col in df.columns:
+            df = df[df[hand_col] == vs_hand]
+        if df.empty:
+            return ok({"player": player["full_name"], "since": since,
+                       "vs_hand": vs_hand, "group": group, "stats": {}})
+        stats = (_aggregate_batter_basic(df) if group == "batting"
+                 else _aggregate_pitcher_basic(df))
+        return ok({"player": player["full_name"], "since": since,
+                   "vs_hand": vs_hand, "group": group,
+                   "stats": round_floats(stats, decimals=3)})
+    except Exception as e:
+        log.exception("player-splits")
+        return JSONResponse(err(str(e)), status_code=200)
+
+
 @app.get("/api/mlb-standings")
 def mlb_standings():
     try:
@@ -1147,6 +1190,21 @@ def get_pitcher_locations(name: str = Query(..., min_length=2),
             return "other"
 
         df = df.assign(outcome_class=desc.map(classify))
+        # Per-pitch RESULT class for client-side filtering: 'k' = the
+        # pitch that ended a strikeout, 'hit' = went for a hit,
+        # 'out' = in play, out(s).
+        events = df.get("events", pd.Series([], dtype=object))
+
+        def classify_event(e) -> str | None:
+            if not isinstance(e, str):
+                return None
+            if e in ("strikeout", "strikeout_double_play"):
+                return "k"
+            if e in HIT_EVENTS:
+                return "hit"
+            return "out" if e in PA_EVENTS else None
+
+        df = df.assign(event_class=events.map(classify_event))
         if outcome != "all":
             df = df[df["outcome_class"] == outcome]
         if df.empty:
@@ -1154,10 +1212,13 @@ def get_pitcher_locations(name: str = Query(..., min_length=2),
                                 status_code=200)
         sz_top = float(df["sz_top"].mean()) if df["sz_top"].notna().any() else 3.4
         sz_bot = float(df["sz_bot"].mean()) if df["sz_bot"].notna().any() else 1.6
-        sample = df if len(df) <= 400 else df.sample(n=400, random_state=14)
+        sample = df if len(df) <= 600 else df.sample(n=600, random_state=14)
         points = [
             {"x": round(float(r.plate_x), 2), "z": round(float(r.plate_z), 2),
-             "type": str(r.pitch_type), "outcome": str(r.outcome_class)}
+             "type": str(r.pitch_type), "outcome": str(r.outcome_class),
+             "stand": (str(r.stand) if isinstance(r.stand, str) else None),
+             "result": (str(r.event_class)
+                        if isinstance(r.event_class, str) else None)}
             for r in sample.itertuples()
         ]
         return ok({"player": player["full_name"], "mlbam_id": player["mlbam_id"],
