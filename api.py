@@ -42,6 +42,9 @@ except Exception:
     pass
 
 from cache import cached  # noqa: E402
+import projections as proj  # noqa: E402
+import requests  # noqa: E402
+from concurrent.futures import ThreadPoolExecutor  # noqa: E402
 
 # ── Constants ───────────────────────────────────────────────────────────────
 
@@ -1042,6 +1045,155 @@ def player_splits(name: str = Query(..., min_length=2),
                    "stats": round_floats(stats, decimals=3)})
     except Exception as e:
         log.exception("player-splits")
+        return JSONResponse(err(str(e)), status_code=200)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Projections — Marcel / Marcel-X computed in-house (see projections.py)
+# ─────────────────────────────────────────────────────────────────────────────
+
+STATSAPI = "https://statsapi.mlb.com/api/v1"
+
+
+def _statsapi_json(path: str, params: dict | None = None) -> dict:
+    r = requests.get(f"{STATSAPI}{path}", params=params or {}, timeout=20)
+    r.raise_for_status()
+    return r.json()
+
+
+@cached(ttl_seconds=6 * 3600)
+def _league_totals(season: int, group: str) -> dict:
+    """All-MLB component totals for one season (30 team rows summed)."""
+    d = _statsapi_json("/teams/stats", {"stats": "season", "group": group,
+                                        "season": season, "sportId": 1})
+    splits = (d.get("stats") or [{}])[0].get("splits") or []
+    adapter = proj.hitter_components if group == "hitting" else proj.pitcher_components
+    total: dict[str, float] = {}
+    for sp in splits:
+        for k, v in adapter(sp.get("stat") or {}).items():
+            total[k] = total.get(k, 0) + v
+    return total
+
+
+@cached(ttl_seconds=6 * 3600)
+def _year_by_year(mlbam_id: int, group: str) -> dict:
+    d = _statsapi_json(f"/people/{mlbam_id}/stats",
+                       {"stats": "yearByYear", "group": group})
+    splits = (d.get("stats") or [{}])[0].get("splits") or []
+    adapter = proj.hitter_components if group == "hitting" else proj.pitcher_components
+    return proj.merge_seasons(splits, adapter)
+
+
+@cached(ttl_seconds=6 * 3600)
+def _roster_people(team_id: int) -> list[dict]:
+    """Active roster with age + primary position (hydrated person)."""
+    d = _statsapi_json(f"/teams/{team_id}/roster",
+                       {"rosterType": "active", "hydrate": "person"})
+    out = []
+    for r in d.get("roster", []):
+        p = r.get("person") or {}
+        out.append({
+            "name": p.get("fullName"), "mlbam_id": p.get("id"),
+            "age": p.get("currentAge"),
+            "position": (r.get("position") or {}).get("abbreviation"),
+        })
+    return [o for o in out if o["mlbam_id"]]
+
+
+def _expected_league_means(season: int) -> dict:
+    """PA-weighted league means of xBA / xSLG / xwOBA from the Savant
+    leaderboard (min 25 PA), for the Marcel-X regression target."""
+    bat = (_expected_stats(season).get("batting") or {})
+    tot_pa = sum(float(r.get("pa") or 0) for r in bat.values())
+    if tot_pa <= 0:
+        return {}
+    def wmean(key):
+        return sum(float(r.get("pa") or 0) * float(r.get(key) or 0)
+                   for r in bat.values() if r.get(key) is not None) / tot_pa
+    return {"xba": wmean("est_ba"), "xslg": wmean("est_slg"), "xwoba": wmean("est_woba")}
+
+
+@cached(ttl_seconds=6 * 3600)
+def _team_projections(team_id: int) -> dict:
+    season = current_season()
+    seasons = [season, season - 1, season - 2]
+    lg_hit = [_league_totals(y, "hitting") for y in seasons]
+    lg_pit = [_league_totals(y, "pitching") for y in seasons]
+    # Savant expected stats per season (current is 12h-cached, past
+    # seasons never change — the same cache serves both).
+    x_league, x_rows = [], []
+    for y in seasons:
+        try:
+            x_rows.append(_expected_stats(y).get("batting") or {})
+            means = _expected_league_means(y)
+            means["lg_totals"] = lg_hit[seasons.index(y)]
+            x_league.append(means)
+        except Exception as e:  # pragma: no cover
+            log.warning("expected stats %s unavailable: %s", y, e)
+            x_rows.append({}); x_league.append({"lg_totals": lg_hit[seasons.index(y)]})
+
+    people = _roster_people(team_id)
+    hitters, pitchers = [], []
+
+    def build(p):
+        is_pitcher = p["position"] == "P"
+        group = "pitching" if is_pitcher else "hitting"
+        by_season = _year_by_year(p["mlbam_id"], group)
+        rows = [by_season.get(y, {}) for y in seasons]
+        used = [y for y, r in zip(seasons, rows)
+                if r.get("bf" if is_pitcher else "pa", 0) > 0]
+        base = {"name": p["name"], "mlbam_id": p["mlbam_id"], "age": p["age"],
+                "seasons_used": used}
+        if is_pitcher:
+            base["marcel"] = proj.project_pitcher(rows, lg_pit, p["age"])
+            return "pitchers", base
+        marcel = proj.project_hitter(rows, lg_hit, p["age"])
+        base["marcel"] = marcel
+        xs = []
+        for y, r in zip(seasons, rows):
+            xr = x_rows[seasons.index(y)].get(str(p["mlbam_id"])) or {}
+            xs.append({"pa": r.get("pa", 0), "xba": xr.get("est_ba"),
+                       "xslg": xr.get("est_slg"), "xwoba": xr.get("est_woba")})
+        base["marcel_x"] = proj.project_hitter_x(xs, x_league, p["age"], marcel) or None
+        return "hitters", base
+
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        for kind, row in ex.map(build, people):
+            (hitters if kind == "hitters" else pitchers).append(row)
+    hitters.sort(key=lambda h: -(h.get("marcel", {}).get("wrc_plus") or 0))
+    pitchers.sort(key=lambda p: (p.get("marcel", {}).get("fip") or 99))
+    return {"season": season, "team_id": team_id, "scale_pa": proj.SCALE_PA,
+            "scale_bf": proj.SCALE_BF, "method": proj.METHOD,
+            "league_woba": round(proj.league_woba(lg_hit[0]) or 0, 3),
+            "hitters": hitters, "pitchers": pitchers}
+
+
+@app.get("/api/projections")
+def get_projections(team_id: int = Query(JAYS_TEAM_ID, ge=100, le=200)):
+    """In-house Marcel / Marcel-X projections for a team's active
+    roster (600 PA / 600 BF scale). Method text rides in `method`."""
+    try:
+        return ok(_team_projections(team_id))
+    except Exception as e:
+        log.exception("projections")
+        return JSONResponse(err(str(e)), status_code=200)
+
+
+@app.get("/api/projections/player")
+def get_player_projection(name: str = Query(..., min_length=2),
+                          team_id: int = Query(JAYS_TEAM_ID, ge=100, le=200)):
+    try:
+        data = _team_projections(team_id)
+        needle = name.strip().lower()
+        for bucket in ("hitters", "pitchers"):
+            for row in data[bucket]:
+                if _name_match(row["name"] or "", needle) or (row["name"] or "").lower() == needle:
+                    return ok({**row, "season": data["season"], "method": data["method"],
+                               "scale_pa": data["scale_pa"], "scale_bf": data["scale_bf"]})
+        return JSONResponse(err(f"no projection for {name!r} on team {team_id}"),
+                            status_code=200)
+    except Exception as e:
+        log.exception("projections-player")
         return JSONResponse(err(str(e)), status_code=200)
 
 
