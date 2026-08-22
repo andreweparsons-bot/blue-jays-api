@@ -125,3 +125,27 @@ def test_components_and_merge():
     assert list(merged) == [2025] and merged[2025]["pa"] == 200
     pc = P.pitcher_components({"inningsPitched": "10.2", "battersFaced": 45})
     assert math.isclose(pc["ip"], 10 + 2 / 3)
+
+
+def test_pick_person_never_returns_a_different_human():
+    import api
+    people = [{"id": 683146, "fullName": "Brett Baty", "active": True,
+               "currentTeam": {"id": 121}}]
+    assert api._pick_person(people, "Brett Bateman") is None
+    people.append({"id": 703520, "fullName": "Brett Bateman", "active": True,
+                   "currentTeam": {"id": 141}})
+    got = api._pick_person(people, "Brett Bateman")
+    assert got["mlbam_id"] == 703520 and got["on_jays"] is True
+    # team id absent (search doesn't hydrate it) → roster names decide
+    bare = [{"id": 703520, "fullName": "Brett Bateman", "active": True}]
+    assert api._pick_person(bare, "Brett Bateman", roster_names=["Brett Bateman"])["on_jays"] is True
+    assert api._pick_person(bare, "Brett Bateman", roster_names=["Ernie Clement"])["on_jays"] is False
+
+
+def test_pick_person_prefers_jays_and_handles_accents_and_suffixes():
+    import api
+    people = [{"id": 1, "fullName": "Vladimir Guerrero", "active": False, "currentTeam": {"id": 108}},
+              {"id": 2, "fullName": "Vladimir Guerrero Jr.", "active": True, "currentTeam": {"id": 141}}]
+    assert api._pick_person(people, "Vladimir Guerrero Jr.")["mlbam_id"] == 2
+    gim = [{"id": 9, "fullName": "Andrés Giménez", "active": True, "currentTeam": {"id": 141}}]
+    assert api._pick_person(gim, "Andres Gimenez")["mlbam_id"] == 9

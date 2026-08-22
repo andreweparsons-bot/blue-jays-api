@@ -301,23 +301,69 @@ def _name_match(roster_name: str, candidate: str) -> bool:
     return bool(rt & ct) and (rt.issubset(ct) or ct.issubset(rt))
 
 
+def _pick_person(people: list[dict], query: str,
+                 team_id: int = JAYS_TEAM_ID,
+                 roster_names: list[str] | None = None) -> dict | None:
+    """Choose the right person from a StatsAPI people/search result:
+    the name must genuinely match the query (loose on suffixes and
+    accents, strict on the actual tokens — never a different human),
+    preferring the Jays, then active players."""
+    def strip(s: str) -> str:
+        import unicodedata
+        return "".join(c for c in unicodedata.normalize("NFKD", s)
+                       if not unicodedata.combining(c))
+    q = strip(query)
+    cands = []
+    for p in people:
+        full = p.get("fullName") or ""
+        if not _name_match(strip(full), q):
+            continue
+        # people/search ignores the currentTeam hydrate, so "is a Jay"
+        # is the team id when present OR a match against the active
+        # roster names we already hold.
+        team = (p.get("currentTeam") or {}).get("id")
+        on_roster = any(_name_match(rn, full) for rn in (roster_names or []))
+        cands.append((team == team_id or on_roster, bool(p.get("active")), p))
+    if not cands:
+        return None
+    cands.sort(key=lambda t: (t[0], t[1]), reverse=True)
+    is_jay, _, p = cands[0]
+    return {"mlbam_id": p.get("id"), "full_name": p.get("fullName"),
+            "on_jays": bool(is_jay)}
+
+
 @cached(ttl_seconds=24 * 3600)
 def _resolve_player(name: str) -> dict | None:
-    """Resolve name → {mlbam_id, full_name, on_jays}. Prefers active Jays."""
+    """Resolve name → {mlbam_id, full_name, on_jays}.
+
+    MLB StatsAPI people/search FIRST — it is the league's own register
+    and carries new signings the moment they are transacted. The
+    Chadwick register behind pybaseball's fuzzy lookup lags (it had
+    no Brett Bateman and cheerfully returned Brett Baty), so it is
+    only a fallback, and a fuzzy hit that does not name-match the
+    query is rejected rather than served as someone else."""
     name = name.strip()
+    try:
+        d = _statsapi_json("/people/search",
+                           {"names": name, "sportIds": 1, "hydrate": "currentTeam"})
+        picked = _pick_person(d.get("people") or [], name,
+                              roster_names=[r["name"] for r in _roster()])
+        if picked and picked.get("mlbam_id"):
+            return picked
+    except Exception as e:
+        log.warning("people/search failed for %r: %s", name, e)
+
     if " " not in name:
         last, first = name, ""
     else:
         parts = name.split()
         first = parts[0]
         last = " ".join(parts[1:])
-
     try:
         df = pybaseball.playerid_lookup(last, first, fuzzy=True)
     except Exception as e:
         log.warning("playerid_lookup failed for %r: %s", name, e)
         return None
-
     if df is None or df.empty:
         return None
 
@@ -327,23 +373,22 @@ def _resolve_player(name: str) -> dict | None:
     df = df[df["mlb_played_last"].notna() & (df["mlb_played_last"] >= season - 1)]
     if df.empty:
         return None
-
-    roster_names = [r["name"] for r in _roster()]
     df["full_name"] = (
         df["name_first"].fillna("").str.title() + " " + df["name_last"].fillna("").str.title()
     ).str.strip()
+    # Strict: the fuzzy candidate must actually be this name.
+    df = df[df["full_name"].apply(lambda fn: _name_match(fn, name))]
+    if df.empty:
+        return None
+    roster_names = [r["name"] for r in _roster()]
     df["is_jay"] = df["full_name"].apply(
         lambda fn: any(_name_match(rn, fn) for rn in roster_names)
     )
     df = df.sort_values(by=["is_jay", "mlb_played_last"], ascending=[False, False])
-
     row = df.iloc[0]
     mlbam = int(row["key_mlbam"]) if pd.notna(row["key_mlbam"]) else None
-    return {
-        "mlbam_id": mlbam,
-        "full_name": str(row["full_name"]),
-        "on_jays": bool(row["is_jay"]),
-    }
+    return {"mlbam_id": mlbam, "full_name": str(row["full_name"]),
+            "on_jays": bool(row["is_jay"])}
 
 
 # ── Statcast: per-player season fetches ─────────────────────────────────────
