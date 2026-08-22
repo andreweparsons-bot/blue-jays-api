@@ -88,6 +88,22 @@ def season_start(year: int | None = None) -> str:
 
 app = FastAPI(title="Blue Jays API", version="0.1.0")
 
+@app.on_event("startup")
+def _warm_projections() -> None:
+    """Projections cost ~40 StatsAPI calls + Savant leaderboards cold;
+    warm the Jays set in the background so the app's first request
+    after a deploy never waits on it."""
+    import threading
+
+    def run():
+        try:
+            _team_projections(JAYS_TEAM_ID)
+            log.info("projections warmed")
+        except Exception as e:  # pragma: no cover
+            log.warning("projection warm-up failed: %s", e)
+    threading.Thread(target=run, daemon=True).start()
+
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -1132,8 +1148,9 @@ def _year_by_year(mlbam_id: int, group: str) -> dict:
 @cached(ttl_seconds=6 * 3600)
 def _roster_people(team_id: int) -> list[dict]:
     """Active roster with age + primary position (hydrated person)."""
+    # 40-man so IL players (Vladdy, Gausman…) still get a projection.
     d = _statsapi_json(f"/teams/{team_id}/roster",
-                       {"rosterType": "active", "hydrate": "person"})
+                       {"rosterType": "40Man", "hydrate": "person"})
     out = []
     for r in d.get("roster", []):
         p = r.get("person") or {}
