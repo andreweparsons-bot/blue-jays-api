@@ -89,6 +89,37 @@ def season_start(year: int | None = None) -> str:
 app = FastAPI(title="Blue Jays API", version="0.1.0")
 
 @app.on_event("startup")
+def _memory_watchdog() -> None:
+    """Solo-user guardrail: if the container's RSS creeps past the
+    threshold (pybaseball frames), drop the heavyweight cache entries
+    instead of drifting toward the plan's memory ceiling. Reads
+    /proc/self/status (Linux container); silently inert elsewhere."""
+    import threading
+
+    def rss_mb() -> float | None:
+        try:
+            with open("/proc/self/status") as f:
+                for line in f:
+                    if line.startswith("VmRSS:"):
+                        return int(line.split()[1]) / 1024.0
+        except Exception:
+            return None
+        return None
+
+    def run():
+        import time as _t
+        from cache import clear_heavy
+        while True:
+            _t.sleep(300)
+            mb = rss_mb()
+            if mb is not None and mb > 1200:
+                dropped = clear_heavy()
+                log.warning("memory watchdog: RSS %.0fMB > 1200MB — "
+                            "dropped %d heavy cache entries", mb, dropped)
+    threading.Thread(target=run, daemon=True).start()
+
+
+@app.on_event("startup")
 def _warm_projections() -> None:
     """Projections cost ~40 StatsAPI calls + Savant leaderboards cold;
     warm the Jays set in the background so the app's first request

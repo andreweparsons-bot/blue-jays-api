@@ -22,11 +22,55 @@ disable that fallback.
 import time
 import functools
 import logging
+import sys
 from typing import Any, Callable
 
 log = logging.getLogger(__name__)
 
+# key -> (stored_at, value). Access times tracked separately for LRU.
 _store: dict[str, tuple[float, Any]] = {}
+_touched: dict[str, float] = {}
+
+# -- Eviction policy --------------------------------------------------
+# Solo-user service on a small Railway container: the cache must be a
+# convenience, never a leak. pybaseball DataFrames are 10-50MB each and
+# keys accumulate per player/season, so we bound BOTH entry count and
+# approximate total bytes, evicting least-recently-used first.
+MAX_ENTRIES = 200
+MAX_BYTES = 500 * 1024 * 1024   # ~500MB of cached values
+
+
+def _approx_bytes(value: Any) -> int:
+    try:
+        mem = getattr(value, "memory_usage", None)   # pandas DataFrame
+        if callable(mem):
+            return int(value.memory_usage(deep=True).sum())
+    except Exception:
+        pass
+    try:
+        return sys.getsizeof(value)
+    except Exception:
+        return 1024
+
+
+def _evict_if_needed() -> None:
+    total = sum(_approx_bytes(v) for _, v in _store.values())
+    while _store and (len(_store) > MAX_ENTRIES or total > MAX_BYTES):
+        oldest = min(_store, key=lambda k: _touched.get(k, 0.0))
+        total -= _approx_bytes(_store[oldest][1])
+        _store.pop(oldest, None)
+        _touched.pop(oldest, None)
+        log.info("cache evicted %s (entries=%d)", oldest.split(":")[0], len(_store))
+
+
+def clear_heavy() -> int:
+    # Emergency valve for the memory watchdog: drop every cached value
+    # over ~1MB (the DataFrames), keep the cheap lookups.
+    heavy = [k for k, (_, v) in _store.items() if _approx_bytes(v) > 1024 * 1024]
+    for k in heavy:
+        _store.pop(k, None)
+        _touched.pop(k, None)
+    return len(heavy)
 
 
 def cached(ttl_seconds: int, strict: bool = False) -> Callable:
@@ -44,11 +88,14 @@ def cached(ttl_seconds: int, strict: bool = False) -> Callable:
             if entry is not None:
                 ts, value = entry
                 if now - ts < ttl_seconds:
+                    _touched[key] = now
                     return value
 
             try:
                 value = fn(*args, **kwargs)
                 _store[key] = (now, value)
+                _touched[key] = now
+                _evict_if_needed()
                 return value
             except Exception as e:
                 if not strict and entry is not None:
