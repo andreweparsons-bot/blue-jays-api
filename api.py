@@ -43,6 +43,7 @@ except Exception:
 
 from cache import cached  # noqa: E402
 import projections as proj  # noqa: E402
+import insights  # noqa: E402
 import requests  # noqa: E402
 from concurrent.futures import ThreadPoolExecutor  # noqa: E402
 
@@ -1287,6 +1288,132 @@ def get_player_projection(name: str = Query(..., min_length=2),
                             status_code=200)
     except Exception as e:
         log.exception("projections-player")
+        return JSONResponse(err(str(e)), status_code=200)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Insight endpoints — Layer 0 (deterministic answers; see insights.py)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@cached(ttl_seconds=1800)
+def _hydrated_roster_stats(team_id: int, group: str) -> list[dict]:
+    d = _statsapi_json(f"/teams/{team_id}/roster",
+                       {"rosterType": "active", "season": current_season(),
+                        "hydrate": f"person(stats(group=[{group}],type=[season]))"})
+    out = []
+    for r in d.get("roster", []):
+        p = r.get("person") or {}
+        stat = {}
+        for g in p.get("stats", []) or []:
+            if (g.get("group") or {}).get("displayName") == group and g.get("splits"):
+                stat = g["splits"][0].get("stat") or {}
+        out.append({"name": p.get("fullName"), "mlbam_id": p.get("id"),
+                    "position": (r.get("position") or {}).get("abbreviation"),
+                    "hand": ((p.get("pitchHand") or {}).get("code")),
+                    "stats": stat})
+    return out
+
+
+@cached(ttl_seconds=1800)
+def _pen_state(team_id: int) -> dict:
+    from datetime import date as _date, timedelta as _td
+    rows = _hydrated_roster_stats(team_id, "pitching")
+    relievers = []
+    for r in rows:
+        if r["position"] != "P" or not r["mlbam_id"]:
+            continue
+        st = r["stats"]
+        games = int(st.get("gamesPitched") or st.get("games") or 0)
+        starts = int(st.get("gamesStarted") or 0)
+        if starts > 0 and starts * 2 >= games:
+            continue                       # starter
+        gl = _statsapi_json(f"/people/{r['mlbam_id']}/stats",
+                            {"stats": "gameLog", "group": "pitching",
+                             "season": current_season()})
+        by: dict[str, int] = {}
+        for sp in ((gl.get("stats") or [{}])[0].get("splits") or []):
+            n = (sp.get("stat") or {}).get("numberOfPitches")
+            if n and sp.get("date"):
+                by[sp["date"]] = by.get(sp["date"], 0) + int(n)
+        relievers.append({"name": r["name"], "hand": r["hand"],
+                          "pitches_by_date": by})
+    days = [(_date.today() - _td(days=o)).isoformat() for o in range(3)]
+    return {"days": days, "rows": insights.pen_rows(relievers, days)}
+
+
+@app.get("/api/insights/pen")
+def insights_pen(team_id: int = Query(JAYS_TEAM_ID, ge=100, le=200)):
+    """Bullpen freshness: per-reliever pitch counts over the last 3
+    days with FRESH / WORKED / HEAVY tags."""
+    try:
+        return ok(_pen_state(team_id))
+    except Exception as e:
+        log.exception("insights-pen")
+        return JSONResponse(err(str(e)), status_code=200)
+
+
+@cached(ttl_seconds=3600)
+def _milestones(team_id: int) -> list[dict]:
+    players = []
+    for group in ("hitting", "pitching"):
+        for r in _hydrated_roster_stats(team_id, group):
+            if not r["mlbam_id"] or not r["stats"]:
+                continue
+            if group == "hitting" and r["position"] == "P":
+                continue
+            if group == "pitching" and r["position"] != "P":
+                continue
+            by_season = _year_by_year(r["mlbam_id"], group)
+            season_now = current_season()
+            best: dict[str, int] = {}
+            for y, comp in by_season.items():
+                if y == season_now:
+                    continue
+                raw = comp  # merged components — map back to statsapi-ish keys
+                mapping = ({"homeRuns": "hr", "stolenBases": "sb", "rbi": None,
+                            "hits": None, "runs": "runs"}
+                           if group == "hitting"
+                           else {"strikeOuts": "so", "wins": None, "saves": None})
+                for stat_key, comp_key in mapping.items():
+                    if comp_key and comp_key in raw:
+                        best[stat_key] = max(best.get(stat_key, 0), int(raw[comp_key]))
+            season_stats = {k: v for k, v in r["stats"].items()
+                            if isinstance(v, int) or (isinstance(v, str) and v.isdigit())}
+            season_stats = {k: int(v) for k, v in season_stats.items()}
+            players.append({"name": r["name"], "group": group,
+                            "season": season_stats, "career_best": best})
+    return insights.milestones(players)
+
+
+@app.get("/api/insights/milestones")
+def insights_milestones(team_id: int = Query(JAYS_TEAM_ID, ge=100, le=200)):
+    """Approaching round numbers + career-high watches, computed."""
+    try:
+        return ok(_milestones(team_id))
+    except Exception as e:
+        log.exception("insights-milestones")
+        return JSONResponse(err(str(e)), status_code=200)
+
+
+@app.get("/api/insights/compare")
+def insights_compare(stat: str,
+                     op: str = Query("lt", pattern="^(lt|gt|lte|gte)$"),
+                     value: float = Query(...),
+                     group: str = Query("hitting", pattern="^(hitting|pitching)$"),
+                     team_id: int = Query(JAYS_TEAM_ID, ge=100, le=200)):
+    """Exhaustive roster comparison, computed in code (the 'which
+    players have fewer X than N' pattern — never an LLM enumeration)."""
+    try:
+        roster = [r for r in _hydrated_roster_stats(team_id, group)
+                  if (r["position"] == "P") == (group == "pitching")]
+        result = insights.compare(roster, group, stat, op, value)
+        if result is None:
+            return JSONResponse(err(f"unsupported stat/op: {stat}/{op}"),
+                                status_code=200)
+        return ok(result)
+    except Exception as e:
+        log.exception("insights-compare")
         return JSONResponse(err(str(e)), status_code=200)
 
 

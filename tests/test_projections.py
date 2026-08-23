@@ -149,3 +149,42 @@ def test_pick_person_prefers_jays_and_handles_accents_and_suffixes():
     assert api._pick_person(people, "Vladimir Guerrero Jr.")["mlbam_id"] == 2
     gim = [{"id": 9, "fullName": "Andrés Giménez", "active": True, "currentTeam": {"id": 141}}]
     assert api._pick_person(gim, "Andres Gimenez")["mlbam_id"] == 9
+
+
+def test_insights_pen_tags():
+    import insights
+    days = ["2026-08-23", "2026-08-22", "2026-08-21"]
+    rows = insights.pen_rows([
+        {"name": "Fresh Arm", "hand": "R", "pitches_by_date": {}},
+        {"name": "B2B Arm", "hand": "L",
+         "pitches_by_date": {"2026-08-22": 7, "2026-08-21": 2}},
+        {"name": "Yesterday Arm", "hand": "R",
+         "pitches_by_date": {"2026-08-22": 13}},
+    ], days)
+    tags = {r["name"]: r["tag"] for r in rows}
+    assert tags == {"Fresh Arm": "FRESH", "B2B Arm": "HEAVY",
+                    "Yesterday Arm": "WORKED"}
+    assert rows[0]["name"] == "Fresh Arm"       # fresh sorts first
+
+
+def test_insights_milestones():
+    import insights
+    facts = insights.milestones([{
+        "name": "Slugger", "group": "hitting",
+        "season": {"homeRuns": 28, "hits": 148},
+        "career_best": {"homeRuns": 30},
+    }])
+    labels = " | ".join(f["label"] for f in facts)
+    assert "2 homeRuns from 30" in labels        # round number AND career high
+    assert "2 hits from 150" in labels
+
+
+def test_insights_compare_exhaustive_and_typed():
+    import insights
+    roster = [{"name": "A", "stats": {"hits": 100}},
+              {"name": "B", "stats": {"hits": 80}},
+              {"name": "C", "stats": {}}]
+    r = insights.compare(roster, "hitting", "hits", "lt", 90)
+    assert [m["name"] for m in r["matches"]] == ["B"]
+    assert r["no_data"] == ["C"]
+    assert insights.compare(roster, "hitting", "notastat", "lt", 1) is None
