@@ -8,12 +8,22 @@ to write a SQL query to that effect."
 
 Shape of it
 -----------
-Every pitch thrown in a Blue Jays game is already available from
-Statcast, which is where this service's arsenal and locations endpoints
-get their data. `pybaseball.statcast(start, end, team='TOR')` returns
-one row per pitch for both sides of every Jays game, which is what we
-want: Jays batters against opposing pitchers AND Jays pitchers against
-opposing batters.
+Every pitch thrown in a Blue Jays game is available from Statcast,
+which is where this service's arsenal and locations endpoints already
+get their data. It takes TWO pulls, not one:
+
+  - `statcast(start, end, team='TOR')` gives Toronto PITCHING. Despite
+    reading like a filter on "games involving Toronto", it returns only
+    the half-innings where the other side bats. Measured on the live
+    table: twenty-three thousand pitches, every one with the opposing
+    team at the plate, and not a single Blue Jays hitter in it.
+  - `statcast_batter(start, end, id)` per Jays hitter gives Toronto
+    BATTING. There is no team-level equivalent, so it is one request
+    per name on the active roster, pitchers excluded.
+
+The two are concatenated and de-duplicated on the pitch itself
+(game_pk, at_bat_number, pitch_number), because a Jay batting in a Jays
+game appears in both pulls.
 
 That frame is held in memory and queried with DuckDB, which reads a
 pandas DataFrame directly with no copy. So there is no database to
@@ -43,6 +53,7 @@ from datetime import datetime, timedelta
 
 import pandas as pd
 import pybaseball
+import statsapi
 
 log = logging.getLogger(__name__)
 
@@ -113,6 +124,51 @@ def _season_bounds(years_back: int = 0) -> tuple[str, str]:
     return f"{start_year}-03-01", today.isoformat()
 
 
+JAYS_TEAM_ID = 141
+
+
+def _jays_batter_ids() -> list[int]:
+    """MLBAM ids for everyone on the active roster who bats.
+
+    Needed because of a Statcast quirk that cost an afternoon: asking
+    for `statcast(team='TOR')` returns ONLY the half-innings where the
+    OTHER side is batting, i.e. Toronto pitching. Checked against the
+    live table, every row came back with the opposing team at the plate
+    and there was not one Blue Jays hitter in twenty-three thousand
+    pitches. So the batting side has to be fetched per player."""
+    try:
+        raw = statsapi.get("team_roster", {"teamId": JAYS_TEAM_ID, "rosterType": "active"})
+    except Exception as exc:                # pragma: no cover
+        log.warning("roster lookup failed, batting side will be missing: %s", exc)
+        return []
+    ids = []
+    for row in raw.get("roster", []):
+        person = row.get("person") or {}
+        pid = person.get("id")
+        # Pitchers bat so rarely in the DH era that their plate
+        # appearances are not worth a request each.
+        code = ((row.get("position") or {}).get("abbreviation") or "").upper()
+        if pid and code != "P":
+            ids.append(int(pid))
+    return ids
+
+
+def _batting_side(start: str, end: str) -> pd.DataFrame:
+    """Every pitch seen by a Blue Jays hitter, one request per hitter."""
+    frames = []
+    for pid in _jays_batter_ids():
+        try:
+            df = pybaseball.statcast_batter(start, end, pid)
+        except Exception as exc:            # pragma: no cover
+            log.warning("statcast_batter %s failed: %s", pid, exc)
+            continue
+        if df is not None and not df.empty:
+            frames.append(df)
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True)
+
+
 def _attach_names(df: pd.DataFrame) -> pd.DataFrame:
     """Statcast gives ids; a chat needs names.
 
@@ -151,7 +207,20 @@ def load(years_back: int = 0, force: bool = False) -> pd.DataFrame:
 
         start, end = _season_bounds(years_back)
         log.info("fetching every Jays pitch [%s..%s]", start, end)
-        raw = pybaseball.statcast(start_dt=start, end_dt=end, team="TOR")
+        # Two halves of the same season. The team pull gives Toronto
+        # PITCHING; the per-hitter pull gives Toronto BATTING. Neither
+        # on its own answers both kinds of question.
+        pitching = pybaseball.statcast(start_dt=start, end_dt=end, team="TOR")
+        batting = _batting_side(start, end)
+        parts = [f for f in (pitching, batting) if f is not None and not f.empty]
+        raw = pd.concat(parts, ignore_index=True) if parts else None
+        if raw is not None and not raw.empty:
+            # A hitter's pull and the team pull can both contain the
+            # same pitch when a Jay bats in a Jays game, so key on the
+            # pitch itself.
+            keys = [c for c in ("game_pk", "at_bat_number", "pitch_number") if c in raw.columns]
+            if keys:
+                raw = raw.drop_duplicates(subset=keys)
         if raw is None or raw.empty:
             log.warning("Statcast returned nothing for [%s..%s]", start, end)
             _frame = pd.DataFrame(columns=COLUMNS)
