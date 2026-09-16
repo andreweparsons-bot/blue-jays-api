@@ -4,3 +4,4 @@ requests>=2.31.0
 MLB-StatsAPI>=1.7.0
 pybaseball>=2.2.7
 pandas>=2.0.0
+duckdb

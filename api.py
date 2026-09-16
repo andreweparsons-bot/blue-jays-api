@@ -35,6 +35,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 log = logging.getLogger("blue-jays-api")
 
 import pybaseball  # noqa: E402  (after logging config)
+import pitches     # noqa: E402
 
 try:
     pybaseball.cache.disable()
@@ -688,6 +689,36 @@ def _aggregate_pitcher_quality(df: pd.DataFrame) -> dict:
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+# ── Pitch by pitch, SQL queryable ────────────────────────────────────
+#
+# Johnny writes the SQL. See pitches.py for why this is a DuckDB view
+# over an in-memory Statcast frame rather than a real database, and for
+# the guard that keeps a model-written query read-only and bounded.
+
+@app.get("/api/jays/pitches/schema")
+def jays_pitch_schema():
+    try:
+        return ok({"schema": pitches.SCHEMA_NOTE, "table": pitches.status()})
+    except Exception as e:
+        log.exception("pitch schema failed")
+        return JSONResponse(err(str(e)), status_code=200)
+
+
+@app.get("/api/jays/pitches/sql")
+def jays_pitch_sql(sql: str = Query(..., min_length=6, max_length=4000),
+                   years_back: int = Query(0, ge=0, le=3)):
+    """One read-only SELECT over every pitch in a Jays game."""
+    try:
+        return ok(pitches.run_sql(sql, years_back=years_back))
+    except pitches.QueryError as e:
+        # A rejected or broken query is a normal outcome, not a fault:
+        # hand the reason back so Johnny can correct it and try again.
+        return JSONResponse(err(str(e)), status_code=200)
+    except Exception as e:
+        log.exception("pitch sql failed")
+        return JSONResponse(err(str(e)), status_code=200)
 
 
 @app.get("/api/jays/season")
