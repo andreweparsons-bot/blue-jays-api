@@ -110,10 +110,17 @@ Notes:
   Toronto is 'TOR' in home_team/away_team."""
 
 _lock = threading.Lock()
-_frame: pd.DataFrame | None = None
-_loaded_at: datetime | None = None
-_loaded_range: tuple[str, str] | None = None
+# One cached table per window (years_back), each with its own clock.
+_frames: dict[int, pd.DataFrame] = {}
+_loaded_at: dict[int, datetime] = {}
+_loaded_range: dict[int, tuple[str, str]] = {}
+_refreshing: set[int] = set()
+_ready: dict[int, threading.Event] = {}
 _TTL = timedelta(hours=6)
+# How long a question will wait for a table that does not exist yet
+# before being told the data is still loading. Kept well under the
+# app's tool timeout so Johnny gets a clear answer, not a dead call.
+_COLD_WAIT_SECONDS = 8
 
 
 def _season_bounds(years_back: int = 0) -> tuple[str, str]:
@@ -196,56 +203,110 @@ def _attach_names(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def load(years_back: int = 0, force: bool = False) -> pd.DataFrame:
-    """The pitch frame, fetched on first use and refreshed on a TTL."""
-    global _frame, _loaded_at, _loaded_range
+def _fetch(years_back: int) -> tuple[pd.DataFrame, tuple[str, str]]:
+    """The slow part: every Jays pitch in the window, both sides, named.
+    Ten seconds warm and a good deal more cold, which is why nothing a
+    user is waiting on may call this directly."""
+    start, end = _season_bounds(years_back)
+    log.info("fetching every Jays pitch [%s..%s]", start, end)
+    # Two halves of the same season. The team pull gives Toronto
+    # PITCHING; the per-hitter pull gives Toronto BATTING. Neither
+    # on its own answers both kinds of question.
+    pitching = pybaseball.statcast(start_dt=start, end_dt=end, team="TOR")
+    batting = _batting_side(start, end)
+    parts = [f for f in (pitching, batting) if f is not None and not f.empty]
+    raw = pd.concat(parts, ignore_index=True) if parts else None
+    if raw is None or raw.empty:
+        log.warning("Statcast returned nothing for [%s..%s]", start, end)
+        return pd.DataFrame(columns=COLUMNS), (start, end)
+    # A hitter's pull and the team pull can both contain the same pitch
+    # when a Jay bats in a Jays game, so key on the pitch itself.
+    keys = [c for c in ("game_pk", "at_bat_number", "pitch_number") if c in raw.columns]
+    if keys:
+        raw = raw.drop_duplicates(subset=keys)
+    raw = _attach_names(raw)
+    keep = [c for c in COLUMNS if c in raw.columns]
+    df = raw[keep].copy()
+    if "game_date" in df.columns:
+        df["game_date"] = pd.to_datetime(df["game_date"]).dt.date
+    log.info("pitch table ready: %s rows, %s columns", len(df), len(df.columns))
+    return df, (start, end)
+
+
+def _refresh(years_back: int) -> None:
+    """Rebuild one window's table off the request path and swap it in."""
+    try:
+        df, rng = _fetch(years_back)
+        with _lock:
+            _frames[years_back] = df
+            _loaded_at[years_back] = datetime.now()
+            _loaded_range[years_back] = rng
+    except Exception as exc:                  # pragma: no cover
+        log.warning("pitch refresh failed, keeping the old table: %s", exc)
+    finally:
+        with _lock:
+            _refreshing.discard(years_back)
+            _ready.setdefault(years_back, threading.Event()).set()
+
+
+def _kick(years_back: int) -> None:
+    """Start a background refresh for a window unless one is running."""
     with _lock:
-        fresh = (_frame is not None and _loaded_at is not None
-                 and datetime.now() - _loaded_at < _TTL)
-        if fresh and not force:
-            return _frame
+        if years_back in _refreshing:
+            return
+        _refreshing.add(years_back)
+        _ready.setdefault(years_back, threading.Event()).clear()
+    threading.Thread(target=_refresh, args=(years_back,), daemon=True,
+                     name=f"pitches-refresh-{years_back}").start()
 
-        start, end = _season_bounds(years_back)
-        log.info("fetching every Jays pitch [%s..%s]", start, end)
-        # Two halves of the same season. The team pull gives Toronto
-        # PITCHING; the per-hitter pull gives Toronto BATTING. Neither
-        # on its own answers both kinds of question.
-        pitching = pybaseball.statcast(start_dt=start, end_dt=end, team="TOR")
-        batting = _batting_side(start, end)
-        parts = [f for f in (pitching, batting) if f is not None and not f.empty]
-        raw = pd.concat(parts, ignore_index=True) if parts else None
-        if raw is not None and not raw.empty:
-            # A hitter's pull and the team pull can both contain the
-            # same pitch when a Jay bats in a Jays game, so key on the
-            # pitch itself.
-            keys = [c for c in ("game_pk", "at_bat_number", "pitch_number") if c in raw.columns]
-            if keys:
-                raw = raw.drop_duplicates(subset=keys)
-        if raw is None or raw.empty:
-            log.warning("Statcast returned nothing for [%s..%s]", start, end)
-            _frame = pd.DataFrame(columns=COLUMNS)
-            _loaded_at = datetime.now()
-            _loaded_range = (start, end)
-            return _frame
 
-        raw = _attach_names(raw)
-        keep = [c for c in COLUMNS if c in raw.columns]
-        df = raw[keep].copy()
-        if "game_date" in df.columns:
-            df["game_date"] = pd.to_datetime(df["game_date"]).dt.date
-        _frame = df
-        _loaded_at = datetime.now()
-        _loaded_range = (start, end)
-        log.info("pitch table ready: %s rows, %s columns", len(df), len(df.columns))
-        return _frame
+def warm() -> None:
+    """Load this season's table at boot, so the first question of the
+    day does not pay for it (Andy, 2026-09-19: Johnny could not run the
+    analysis because the load happened inside his tool call)."""
+    _kick(0)
+
+
+def load(years_back: int = 0, force: bool = False) -> pd.DataFrame:
+    """The pitch table for a window, WITHOUT ever blocking on a rebuild
+    when a table already exists.
+
+    This used to rebuild inline once the six hour cache lapsed, so the
+    first question after a lapse waited on a full Statcast re-pull, ten
+    seconds warm and more cold. The app gives a tool twelve seconds, so
+    Johnny's call died and he told Andy he could not do it. Now a stale
+    table is served at once and refreshed behind it; only a window that
+    has never loaded waits, briefly, and then says so plainly."""
+    with _lock:
+        df = _frames.get(years_back)
+        at = _loaded_at.get(years_back)
+    stale = df is None or at is None or datetime.now() - at >= _TTL
+    if stale or force:
+        _kick(years_back)
+    if df is not None:
+        return df
+    # Never loaded. Give it a moment, then report honestly.
+    ready = _ready.setdefault(years_back, threading.Event())
+    ready.wait(timeout=_COLD_WAIT_SECONDS)
+    with _lock:
+        df = _frames.get(years_back)
+    if df is None:
+        raise QueryError("warming: the pitch database is loading after a restart and "
+                         "will be ready in about a minute. Tell the user that plainly "
+                         "and offer to run the query again shortly.")
+    return df
 
 
 def status() -> dict:
+    df = _frames.get(0)
+    at = _loaded_at.get(0)
+    rng = _loaded_range.get(0)
     return {
-        "rows": 0 if _frame is None else int(len(_frame)),
-        "columns": [] if _frame is None else list(_frame.columns),
-        "loaded_at": _loaded_at.isoformat() if _loaded_at else None,
-        "range": list(_loaded_range) if _loaded_range else None,
+        "rows": 0 if df is None else int(len(df)),
+        "columns": [] if df is None else list(df.columns),
+        "loaded_at": at.isoformat() if at else None,
+        "range": list(rng) if rng else None,
+        "refreshing": 0 in _refreshing,
     }
 
 

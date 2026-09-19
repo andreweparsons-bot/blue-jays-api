@@ -122,6 +122,18 @@ def _memory_watchdog() -> None:
 
 
 @app.on_event("startup")
+def _warm_pitches() -> None:
+    """Load the pitch table as soon as the container is up, so the
+    first question after a deploy or restart is answered from memory
+    rather than waiting on a full Statcast pull inside Johnny's tool
+    call. Runs in its own thread; boot is not held up."""
+    try:
+        pitches.warm()
+    except Exception as e:  # pragma: no cover
+        log.warning("pitch warm-up failed to start: %s", e)
+
+
+@app.on_event("startup")
 def _warm_projections() -> None:
     """Projections cost ~40 StatsAPI calls + Savant leaderboards cold;
     warm the Jays set in the background so the app's first request
